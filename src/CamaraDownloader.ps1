@@ -4,7 +4,7 @@
 # La copia corre en un hilo aparte para que la ventana nunca se congele.
 
 $AppName    = 'Cámara Downloader'
-$AppVersion = '2.0.0'
+$AppVersion = '2.1.0'
 $UpdateRepo = 'ChrisAlf27/CamaraDownloader'
 $SetupAsset = 'CamaraDownloader-Setup.exe'
 
@@ -28,6 +28,9 @@ $Settings = @{
         Insta360 = Join-Path $Videos 'Insta360'
         Folder   = Join-Path $Videos 'Cámara Downloader'
     }
+    # "Enviar copia a": segunda carpeta (ej. \\pc-casa\Videos por Tailscale) a la que se mandan los archivos nuevos
+    Mirror   = @{ GoPro = ''; Insta360 = ''; Folder = '' }
+    MirrorOn = @{ GoPro = $false; Insta360 = $false; Folder = $false }
 }
 try {
     if (Test-Path -LiteralPath $SettingsFile) {
@@ -35,9 +38,15 @@ try {
         if ($DeviceTypes -contains $j.Device) { $Settings.Device = [string]$j.Device }
         if ($j.SourceFolder) { $Settings.SourceFolder = [string]$j.SourceFolder }
         $Settings.IncludeSidecar = [bool]$j.IncludeSidecar
-        foreach ($k in $DeviceTypes) { if ($j.Dest.$k) { $Settings.Dest[$k] = [string]$j.Dest.$k } }
+        foreach ($k in $DeviceTypes) {
+            if ($j.Dest.$k) { $Settings.Dest[$k] = [string]$j.Dest.$k }
+            if ($j.Mirror.$k) { $Settings.Mirror[$k] = [string]$j.Mirror.$k }
+            if ($null -ne $j.MirrorOn.$k) { $Settings.MirrorOn[$k] = [bool]$j.MirrorOn.$k }
+        }
     }
 } catch {}
+# Archivos que no se pudieron enviar (PC destino apagada, sin conexion...): se reintentan despues
+$PendingFile = Join-Path $SettingsDir 'pendientes.json'
 
 function Save-Settings {
     try {
@@ -54,6 +63,40 @@ $SidecarExt = @('.LRV', '.THM')   # proxies / miniaturas (GoPro e Insta360)
 $SkipNames  = @('Thumbs.db', 'desktop.ini', '.DS_Store', 'fileinfo_list.list')
 $StageName  = '_copiando'         # carpeta temporal dentro del destino (copias a medio hacer)
 $script:Shell = New-Object -ComObject Shell.Application
+
+# Ruta escrita o pegada a mano: sin espacios ni comillas alrededor ("Copiar como ruta de acceso" las agrega)
+function Get-CleanPath([string]$p) { if (-not $p) { return '' }; return $p.Trim().Trim('"').Trim() }
+
+# Crea la carpeta solo si no existe. New-Item falla con la raiz de una carpeta compartida (\\pc\recurso)
+# aunque exista ("la ruta de acceso no tiene un formato valido"), y esa raiz no se puede crear desde aca.
+function New-Folder([string]$p) {
+    $exists = $false
+    try { $exists = Test-Path -LiteralPath $p -PathType Container } catch {}   # si la PC de red no responde, falla
+    if ($exists) { return }
+    if ($p -match '^\\\\[^\\]+\\[^\\]+\\?$') {
+        throw "No se puede acceder a la carpeta compartida $p. Revisá que la otra PC esté prendida, que la carpeta esté compartida con ese nombre y que hayas entrado una vez desde el Explorador guardando la contraseña."
+    }
+    New-Item -ItemType Directory -Force -Path $p | Out-Null
+}
+
+# Cola de envios pendientes: lista de @{ Src; Dst; Root }
+function Read-Pending([string]$p) {
+    try {
+        if (-not (Test-Path -LiteralPath $p)) { return }
+        foreach ($x in (ConvertFrom-Json -InputObject (Get-Content -LiteralPath $p -Raw -Encoding UTF8))) {
+            if ($x.Src -and $x.Dst -and $x.Root) { @{ Src = [string]$x.Src; Dst = [string]$x.Dst; Root = [string]$x.Root } }
+        }
+    } catch {}
+}
+
+function Write-Pending([string]$p, $items) {
+    try {
+        $arr = @($items | Where-Object { $_ -is [hashtable] } | ForEach-Object { [pscustomobject]@{ Src = $_.Src; Dst = $_.Dst; Root = $_.Root } })
+        if ($arr.Count -eq 0) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }; return }
+        New-Item -ItemType Directory -Force -Path (Split-Path $p -Parent) | Out-Null
+        ConvertTo-Json -InputObject $arr -Depth 3 | Set-Content -LiteralPath $p -Encoding UTF8
+    } catch {}
+}
 
 function Format-Size([double]$b) {
     if ($b -ge 1GB) { return '{0:N2} GB' -f ($b / 1GB) }
@@ -196,7 +239,9 @@ function Get-SourceFiles($src) {
                 if ($SkipNames -contains $fi.Name) { continue }
                 $folderKey = $f.Name
                 if ($src.Recurse) { $folderKey = $fi.DirectoryName.Substring([Math]::Min($rootLen, $fi.DirectoryName.Length)).Trim('\'); if (-not $folderKey) { $folderKey = '.' } }
-                $date = Get-NameDate $fi.Name; if (-not $date) { $date = $fi.LastWriteTime }
+                # En "Otra carpeta" se respeta la fecha del archivo tal cual (no se ordena por fecha)
+                $date = if ($src.Type -eq 'Folder') { $fi.LastWriteTime } else { Get-NameDate $fi.Name }
+                if (-not $date) { $date = $fi.LastWriteTime }
                 [void]$list.Add([pscustomobject]@{ Name = $fi.Name; Size = [int64]$fi.Length; Date = $date
                     Folder = $folderKey; Ref = $fi; Sidecar = ($SidecarExt -contains $fi.Extension.ToUpper()) })
             }
@@ -218,7 +263,8 @@ function Get-SourceFiles($src) {
 
 # ============================================================ hilo de copia
 $WorkerCode = @'
-param($sync, $destRoot, $includeSidecar, $coreCode, $type, $srcFolder)
+param($sync, $destRoot, $includeSidecar, $coreCode, $type, $srcFolder, $mirrorRoot, $pendingFile)
+# $type = 'Pending': no descarga nada, solo reintenta los envios pendientes
 . ([scriptblock]::Create($coreCode))
 function Log([string]$m) { $sync.Log.Enqueue(('[{0:HH:mm:ss}] {1}' -f (Get-Date), $m)) }
 
@@ -238,10 +284,11 @@ function Resolve-Dest([string]$dir, [string]$name) {
 }
 
 # Copia a "archivo.part" y renombra al terminar: en el destino nunca queda un archivo a medias
-function Copy-DriveFile($file, [string]$dest) {
+function Copy-FileTo([string]$srcPath, [string]$dest) {
     $part = "$dest.part"
     $buf = New-Object byte[] (8MB)
-    $in = [IO.File]::OpenRead($file.Ref.FullName); $out = [IO.File]::Create($part)
+    $in = [IO.File]::OpenRead($srcPath)
+    try { $out = [IO.File]::Create($part) } catch { $in.Close(); throw }
     try {
         while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
             $out.Write($buf, 0, $n); $sync.Done += $n
@@ -273,41 +320,131 @@ function Copy-MtpFile($file, [string]$stage) {
     }
 }
 
-$stage = Join-Path $destRoot $StageName
+# Envia copias (Src -> Dst) a la segunda carpeta. Devuelve las que no se pudieron enviar.
+function Send-Copies($items) {
+    $failed = New-Object System.Collections.ArrayList
+    $seen = @{}; $list = New-Object System.Collections.ArrayList
+    foreach ($it in $items) {
+        if ($seen.ContainsKey($it.Dst.ToUpper())) { continue }
+        $seen[$it.Dst.ToUpper()] = $true
+        if (Test-Path -LiteralPath $it.Src -PathType Leaf) { [void]$list.Add($it) }
+        else { Log "No se envia $($it.Src): ya no existe en esta PC." }
+    }
+    if ($list.Count -eq 0) { return }
+    # Se prueba cada carpeta destino una sola vez (si la otra PC esta apagada no se espera archivo por archivo)
+    $ok = @{}
+    foreach ($root in @($list | ForEach-Object { $_.Root } | Sort-Object -Unique)) {
+        try {
+            New-Folder $root
+            if (Test-Path -LiteralPath $root -PathType Container) { $ok[$root] = $true } else { throw 'no existe' }
+        } catch { Log "ERROR  No se puede acceder a $root ($_). ¿La otra PC esta prendida y conectada?" }
+    }
+    $sync.Total = [int64](($list | ForEach-Object { ([IO.FileInfo]::new($_.Src)).Length } | Measure-Object -Sum).Sum)
+    $sync.Done = [int64]0; $sync.Started = Get-Date
+    Log ('Enviando {0} archivos ({1})...' -f $list.Count, (Format-Size $sync.Total))
+    $i = 0
+    foreach ($it in $list) {
+        $i++
+        $size = ([IO.FileInfo]::new($it.Src)).Length
+        $name = [IO.Path]::GetFileName($it.Dst)
+        if ($sync.Cancel -or -not $ok[$it.Root]) { [void]$failed.Add($it); $sync.Done += $size; continue }
+        $sync.File = "Enviando ($i/$($list.Count))  $name  -  $(Format-Size $size)"
+        $before = $sync.Done; $tmp = $null
+        try {
+            $dir = [IO.Path]::GetDirectoryName($it.Dst)
+            # Mismo criterio que la descarga: si ya esta (mismo tamano) se saltea; si hay otro distinto, "nombre (2).ext"
+            $target = $it.Dst; $n = 1; $skip = $false
+            while (Test-Path -LiteralPath $target) {
+                if (([IO.FileInfo]::new($target)).Length -eq $size) { $skip = $true; break }
+                $n++; $target = [IO.Path]::Combine($dir, ('{0} ({1}){2}' -f [IO.Path]::GetFileNameWithoutExtension($it.Dst), $n, [IO.Path]::GetExtension($it.Dst)))
+            }
+            if ($skip) { Log "Ya estaba  $target" }
+            else {
+                New-Folder $dir
+                $tmp = Copy-FileTo $it.Src $target
+                $len = ([IO.FileInfo]::new($tmp)).Length
+                if ($len -ne $size) { throw "tamano distinto ($len vs $size)" }
+                Move-Item -LiteralPath $tmp -Destination $target; $tmp = $null
+                $t0 = [IO.File]::GetLastWriteTime($it.Src)
+                [IO.File]::SetLastWriteTime($target, $t0); [IO.File]::SetCreationTime($target, $t0)
+                Log "Enviado  $name  ->  $target"
+            }
+            $sync.Done = $before + $size
+        } catch {
+            $sync.Done = $before + $size
+            [void]$failed.Add($it)
+            if ("$_" -eq 'Cancelado') { Log "Cancelado: $name (no se envio)" } else { Log "ERROR enviando $name : $_" }
+            if ($tmp -and (Test-Path -LiteralPath $tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    foreach ($f in $failed) { $f }
+}
+
+$stage = $null
+$toSend = New-Object System.Collections.ArrayList   # archivos copiados en esta descarga, para enviar despues
 try {
+  if ($type -ne 'Pending') {
+    $stage = Join-Path $destRoot $StageName
     $src = Find-Source $type $srcFolder
     if (-not $src) { throw "No se encontro el origen ($type)." }
+    $folderMode = $type -eq 'Folder'
     Log "Leyendo archivos de $($src.Name)..."
-    $files = @(Get-SourceFiles $src | Where-Object { $includeSidecar -or -not $_.Sidecar } | Sort-Object Date, Name)
+    $files = @(Get-SourceFiles $src | Where-Object { $folderMode -or $includeSidecar -or -not $_.Sidecar } | Sort-Object Date, Name)
     $noDate = @($files | Where-Object { -not $_.Date }).Count
     if ($noDate -gt 0) { Log "Atencion: $noDate archivos sin fecha legible, van a la carpeta 'Sin fecha'." }
 
-    New-Item -ItemType Directory -Force -Path $destRoot | Out-Null
+    # Otra carpeta: se copia entera, con su nombre y sus subcarpetas, dentro de "Guardar en"
+    $destBase = $destRoot
+    if ($folderMode) {
+        $fi0 = $src.Folders[0]
+        $baseName = if ($fi0.Parent) { $fi0.Name } else { 'Unidad ' + (($fi0.FullName -replace '[\\/:*?"<>|]+', ' ').Trim()) }
+        $destBase = Join-Path $destRoot $baseName
+        Log "Se copia la carpeta completa en $destBase"
+    }
+
+    New-Folder $destRoot
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 
     # Indice de lo que ya hay en el destino (nombre+tamano) para no recopiar.
     # "foto (2).jpg" tambien cuenta como "foto.jpg" (renombrada por coincidir con otro archivo).
+    # Camara: se busca en cualquier carpeta de fecha. Otra carpeta: en la misma subcarpeta.
     # Los ".part" son restos de una copia cortada (app cerrada a la mitad): se borran.
     $existing = @{}
-    Get-ChildItem -LiteralPath $destRoot -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notlike (Join-Path $destRoot 'App\*') } |
-        ForEach-Object {
-            if ($_.Extension -eq '.part' -and $_.Directory.Name -match '^\d{4}-\d{2}-\d{2}$|^Sin fecha$') { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue; return }
-            $existing["$($_.Name.ToUpper())|$($_.Length)"] = $_.FullName
-            if ($_.BaseName -match '^(.*) \(\d+\)$') { $existing["$($Matches[1].ToUpper())$($_.Extension.ToUpper())|$($_.Length)"] = $_.FullName }
-        }
+    if (Test-Path -LiteralPath $destBase) {
+        # Largo de la ruta REAL (Get-ChildItem devuelve nombres largos aunque se haya escrito "CHRIST~1" o con otras mayusculas)
+        $baseLen = (Get-Item -LiteralPath $destBase).FullName.TrimEnd('\').Length
+        Get-ChildItem -LiteralPath $destBase -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $folderMode -or $_.FullName -notlike (Join-Path $destRoot 'App\*') } |
+            ForEach-Object {
+                if (-not $folderMode -and $_.Extension -eq '.part' -and $_.Directory.Name -match '^\d{4}-\d{2}-\d{2}$|^Sin fecha$') { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue; return }
+                $pre = ''
+                if ($folderMode) {
+                    $rel = $_.DirectoryName.Substring([Math]::Min($baseLen, $_.DirectoryName.Length)).Trim('\'); if (-not $rel) { $rel = '.' }
+                    $pre = "$($rel.ToUpper())|"
+                }
+                $existing["$pre$($_.Name.ToUpper())|$($_.Length)"] = $_.FullName
+                if ($_.BaseName -match '^(.*) \(\d+\)$') { $existing["$pre$($Matches[1].ToUpper())$($_.Extension.ToUpper())|$($_.Length)"] = $_.FullName }
+            }
+    }
 
     $todo = New-Object System.Collections.ArrayList; $planned = @{}; $skipped = 0; $moved = 0
     foreach ($f in $files) {
-        $folderName = if ($f.Date) { $f.Date.ToString('yyyy-MM-dd') } else { 'Sin fecha' }
-        $dir = Join-Path $destRoot $folderName
+        if ($folderMode) {
+            $dir = if ($f.Folder -eq '.') { $destBase } else { Join-Path $destBase $f.Folder }
+            $key = "$($f.Folder.ToUpper())|$($f.Name.ToUpper())|$($f.Size)"
+        } else {
+            $folderName = if ($f.Date) { $f.Date.ToString('yyyy-MM-dd') } else { 'Sin fecha' }
+            $dir = Join-Path $destRoot $folderName
+            $key = "$($f.Name.ToUpper())|$($f.Size)"
+        }
         $dest = Join-Path $dir $f.Name
-        $prev = if ($f.Size -gt 0) { $existing["$($f.Name.ToUpper())|$($f.Size)"] } else { $null }
+        if ($folderMode -and (Test-Path -LiteralPath "$dest.part")) { Remove-Item -LiteralPath "$dest.part" -Force -ErrorAction SilentlyContinue }
+        $prev = if ($f.Size -gt 0 -or $folderMode) { $existing[$key] } else { $null }
         if ($prev) {
             $prevDir = Split-Path $prev -Parent
-            if ($prevDir -ne $dir -and (Split-Path $prevDir -Leaf) -match '^1899-12-30$|^Sin fecha$') {
+            if (-not $folderMode -and $prevDir -ne $dir -and (Split-Path $prevDir -Leaf) -match '^1899-12-30$|^Sin fecha$') {
                 # ya copiado pero con fecha erronea: se mueve a la carpeta correcta
-                New-Item -ItemType Directory -Force -Path $dir | Out-Null
+                New-Folder $dir
                 if (-not (Test-Path -LiteralPath $dest)) {
                     Move-Item -LiteralPath $prev -Destination $dest; $moved++
                     if ($f.Date) { [IO.File]::SetLastWriteTime($dest, $f.Date); [IO.File]::SetCreationTime($dest, $f.Date) }
@@ -324,9 +461,11 @@ try {
         [void]$todo.Add([pscustomobject]@{ File = $f; Dir = $dir; Dest = $dest })
     }
     $sync.Total = [int64](($todo | ForEach-Object { $_.File.Size } | Measure-Object -Sum).Sum)
-    # Limpia carpetas que quedaron vacias (ej. 1899-12-30)
-    Get-ChildItem -LiteralPath $destRoot -Directory | Where-Object { $_.Name -ne 'App' -and -not (Get-ChildItem -LiteralPath $_.FullName -Force) } |
-        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+    # Limpia carpetas de fecha que quedaron vacias (ej. 1899-12-30)
+    if (-not $folderMode) {
+        Get-ChildItem -LiteralPath $destRoot -Directory | Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$|^Sin fecha$' -and -not (Get-ChildItem -LiteralPath $_.FullName -Force) } |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+    }
     if ($moved -gt 0) { Log "$moved archivos ya copiados se movieron a su carpeta de fecha correcta." }
     Log ('{0} archivos en el origen, {1} ya estaban copiados, {2} nuevos ({3}).' -f $files.Count, $skipped, $todo.Count, (Format-Size $sync.Total))
     $sync.Started = Get-Date
@@ -339,8 +478,8 @@ try {
         $before = $sync.Done
         $tmp = $null
         try {
-            New-Item -ItemType Directory -Force -Path $t.Dir | Out-Null
-            if ($src.Mode -eq 'Drive') { $tmp = Copy-DriveFile $t.File $t.Dest }
+            New-Folder $t.Dir
+            if ($src.Mode -eq 'Drive') { $tmp = Copy-FileTo $t.File.Ref.FullName $t.Dest }
             else {
                 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
                 (New-Item -ItemType Directory -Force -Path $stage).Attributes = 'Directory, Hidden'
@@ -352,6 +491,11 @@ try {
             if ($t.File.Date) { [IO.File]::SetLastWriteTime($t.Dest, $t.File.Date); [IO.File]::SetCreationTime($t.Dest, $t.File.Date) }
             $sync.Done = $before + [Math]::Max($t.File.Size, $len)
             [void]$sync.Copied.Add("$($t.File.Folder)\$($t.File.Name)")
+            if ($mirrorRoot) {
+                $rel = $t.Dest.Substring($destRoot.TrimEnd('\').Length).TrimStart('\')
+                # Path.Combine y no Join-Path: Join-Path falla si la unidad no existe (ej. unidad de red desconectada)
+                [void]$toSend.Add(@{ Src = $t.Dest; Dst = [IO.Path]::Combine($mirrorRoot, $rel); Root = $mirrorRoot })
+            }
             Log "OK  $($t.File.Name)  ->  $($t.Dest)"
         } catch {
             $sync.Errors++
@@ -362,11 +506,33 @@ try {
         }
     }
     $sync.File = "Listo: $($i - $sync.Errors) copiados, $($sync.Errors) con error."
+  }
 } catch {
     $sync.Errors++
     Log "ERROR: $_"
 } finally {
-    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($stage -and (Test-Path -LiteralPath $stage)) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# Envio a la segunda carpeta: lo nuevo de esta descarga + lo que haya quedado pendiente de antes
+try {
+    if ($mirrorRoot -or $type -eq 'Pending') {
+        $items = @(@(Read-Pending $pendingFile) + @($toSend))
+        if ($items.Count -eq 0) { if ($type -eq 'Pending') { Log 'No hay archivos pendientes de enviar.' } }
+        else {
+            $failed = @(Send-Copies $items | Where-Object { $_ -is [hashtable] })
+            Write-Pending $pendingFile $failed
+            $sync.SendErrors = $failed.Count
+            if ($failed.Count) {
+                Log "Quedaron $($failed.Count) archivos sin enviar. Se reintentan con 'Enviar pendientes' o en la proxima descarga."
+                $sync.File = "Envío: $($failed.Count) archivos pendientes."
+            } else { Log 'Envio completo.'; $sync.File = 'Listo: todo copiado y enviado.' }
+        }
+    }
+} catch {
+    $sync.SendErrors++
+    Log "ERROR enviando: $_"
+} finally {
     $sync.Finished = $true
 }
 '@
@@ -411,18 +577,27 @@ function Write-Log([string]$msg) {
 function Set-Status([string]$text, [string]$color) { $lblDevice.Text = $text; $lblDevice.ForeColor = $color }
 
 function Set-Busy([bool]$b) {
-    foreach ($c in @($btnDownload, $btnDetect, $btnBrowse, $chkSidecar, $txtDest, $rbGoPro, $rbInsta, $rbFolder)) { $c.Enabled = -not $b }
+    foreach ($c in @($btnDownload, $btnDetect, $btnBrowse, $txtDest, $rbGoPro, $rbInsta, $rbFolder, $chkMirror, $btnPending)) { $c.Enabled = -not $b }
     $btnSrc.Enabled = (-not $b) -and $script:Device -eq 'Folder'
+    $chkSidecar.Enabled = (-not $b) -and $script:Device -ne 'Folder'   # en "Otra carpeta" se copia todo
+    $txtMirror.Enabled = (-not $b) -and $chkMirror.Checked
+    $btnMirror.Enabled = (-not $b) -and $chkMirror.Checked
     $txtSrc.Enabled = -not $b
     $btnCancel.Enabled = $b
+}
+
+function Update-PendingButton {
+    $n = @(Read-Pending $PendingFile).Count
+    $btnPending.Text = "Enviar pendientes ($n)"
+    $btnPending.Visible = $n -gt 0
 }
 
 function Update-Status {
     $t = $script:Device
     if ($t -eq 'Folder') {
-        $p = $txtSrc.Text.Trim()
+        $p = Get-CleanPath $txtSrc.Text
         if (-not $p) { Set-Status 'Elegí la carpeta de origen con "Elegir..."' 'DimGray' }
-        elseif (Test-Path -LiteralPath $p -PathType Container) { Set-Status 'Carpeta de origen lista' 'ForestGreen' }
+        elseif (Test-Path -LiteralPath $p -PathType Container) { Set-Status "Carpeta lista: se copia completa en Guardar en\$(Split-Path $p -Leaf)" 'ForestGreen' }
         else { Set-Status 'La carpeta de origen no existe' 'Firebrick' }
         return
     }
@@ -446,7 +621,11 @@ function Set-Device([string]$type) {
     $txtSrc.ReadOnly = $type -ne 'Folder'
     $txtSrc.BackColor = if ($type -eq 'Folder') { [System.Drawing.SystemColors]::Window } else { [System.Drawing.SystemColors]::Control }
     $btnSrc.Enabled = $type -eq 'Folder'
+    $chkSidecar.Enabled = $type -ne 'Folder'
     if ($type -eq 'Folder') { $txtSrc.Text = $Settings.SourceFolder }
+    $txtMirror.Text = $Settings.Mirror[$type]
+    $chkMirror.Checked = [bool]$Settings.MirrorOn[$type]
+    $txtMirror.Enabled = $chkMirror.Checked; $btnMirror.Enabled = $chkMirror.Checked
     $script:Loading = $false
     Update-Status
 }
@@ -475,29 +654,46 @@ function Test-PathInside([string]$child, [string]$parent) {
     return $c.StartsWith($p, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Show-Msg([string]$text) { [System.Windows.Forms.MessageBox]::Show($text, $AppName) | Out-Null }
+
 function Start-Download {
     $type = $script:Device
     $srcFolder = ''
     if ($type -eq 'Folder') {
-        $srcFolder = $txtSrc.Text.Trim()
+        $srcFolder = Get-CleanPath $txtSrc.Text
         if (-not $srcFolder -or -not (Test-Path -LiteralPath $srcFolder -PathType Container)) {
-            [System.Windows.Forms.MessageBox]::Show('Elegí una carpeta de origen que exista.', $AppName) | Out-Null; return
+            Show-Msg "Elegí una carpeta de origen que exista.`n`nOrigen: $srcFolder"; return
         }
     } elseif (-not ($script:Cameras | Where-Object { $_.Type -eq $type })) {
         Invoke-Detect $false
         if (-not ($script:Cameras | Where-Object { $_.Type -eq $type })) { return }
     }
-    $destRoot = $txtDest.Text.Trim()
-    if (-not $destRoot) { [System.Windows.Forms.MessageBox]::Show('Elegí dónde guardar los archivos.', $AppName) | Out-Null; return }
-    if ($type -eq 'Folder' -and ((Test-PathInside $destRoot $srcFolder) -or (Test-PathInside $srcFolder $destRoot))) {
-        [System.Windows.Forms.MessageBox]::Show('La carpeta de origen y la de destino no pueden estar una dentro de la otra.', $AppName) | Out-Null; return
+    $destRoot = Get-CleanPath $txtDest.Text
+    if (-not $destRoot) { Show-Msg 'Elegí dónde guardar los archivos.'; return }
+    $mirrorRoot = ''
+    if ($chkMirror.Checked) {
+        $mirrorRoot = Get-CleanPath $txtMirror.Text
+        if (-not $mirrorRoot) { Show-Msg 'Elegí a dónde enviar la copia, o destildá "Enviar copia a".'; return }
     }
-    try { New-Item -ItemType Directory -Force -Path $destRoot | Out-Null }
+    try {
+        foreach ($p in @($srcFolder, $destRoot, $mirrorRoot)) { if ($p) { [void][IO.Path]::GetFullPath($p) } }
+    } catch { Show-Msg "La ruta `"$p`" no es válida.`n`n$($_.Exception.InnerException.Message)"; return }
+    if ($type -eq 'Folder' -and ((Test-PathInside $destRoot $srcFolder) -or (Test-PathInside $srcFolder $destRoot))) {
+        Show-Msg 'La carpeta de origen y la de destino no pueden estar una dentro de la otra.'; return
+    }
+    if ($mirrorRoot -and ((Test-PathInside $mirrorRoot $destRoot) -or (Test-PathInside $destRoot $mirrorRoot) -or
+                          ($srcFolder -and ((Test-PathInside $mirrorRoot $srcFolder) -or (Test-PathInside $srcFolder $mirrorRoot))))) {
+        Show-Msg 'La carpeta de "Enviar copia a" tiene que ser distinta del origen y de "Guardar en" (y no estar una dentro de la otra).'; return
+    }
+    try { New-Folder $destRoot }
     catch { [System.Windows.Forms.MessageBox]::Show("No se puede crear $destRoot`n$_", 'Error') | Out-Null; return }
     Save-Settings
+    Start-Worker $type $srcFolder $destRoot $mirrorRoot
+}
 
+function Start-Worker([string]$type, [string]$srcFolder, [string]$destRoot, [string]$mirrorRoot) {
     $script:Sync = [hashtable]::Synchronized(@{
-        Cancel = $false; Finished = $false; Done = [int64]0; Total = [int64]0; Errors = 0
+        Cancel = $false; Finished = $false; Done = [int64]0; Total = [int64]0; Errors = 0; SendErrors = 0
         File = ''; Started = $null; Type = $type; SrcFolder = $srcFolder
         Log = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
         Copied = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
@@ -506,7 +702,7 @@ function Start-Download {
     $rs.ApartmentState = 'STA'; $rs.ThreadOptions = 'ReuseThread'; $rs.Open()
     $script:PS = [powershell]::Create()
     $script:PS.Runspace = $rs
-    [void]$script:PS.AddScript($WorkerCode).AddArgument($script:Sync).AddArgument($destRoot).AddArgument($chkSidecar.Checked).AddArgument($CoreCode).AddArgument($type).AddArgument($srcFolder)
+    [void]$script:PS.AddScript($WorkerCode).AddArgument($script:Sync).AddArgument($destRoot).AddArgument($chkSidecar.Checked).AddArgument($CoreCode).AddArgument($type).AddArgument($srcFolder).AddArgument($mirrorRoot).AddArgument($PendingFile)
     $progress.Value = 0; $lblSpeed.Text = ''; $lblFile.Text = 'Preparando...'
     Set-Busy $true
     $script:Handle = $script:PS.BeginInvoke()
@@ -534,7 +730,9 @@ function Update-Progress {
         try { [void]$script:PS.EndInvoke($script:Handle) } catch {}
         try { $script:PS.Runspace.Close(); $script:PS.Dispose(); $script:PS = $null } catch {}
         Set-Busy $false
-        if ($s.Errors -eq 0 -and -not $s.Cancel) { $progress.Value = 1000; Ask-Delete }
+        Update-PendingButton
+        if ($s.Type -eq 'Pending') { if ($s.SendErrors -eq 0 -and -not $s.Cancel) { $progress.Value = 1000 } }
+        elseif ($s.Errors -eq 0 -and -not $s.Cancel) { $progress.Value = 1000; Ask-Delete }
         elseif ($s.Errors -gt 0) { Write-Log 'Hubo errores: no se ofrece borrar el origen. Tocá "Descargar todo" otra vez para reintentar (saltea lo ya copiado).' }
     }
 }
@@ -628,7 +826,7 @@ function Update-UpdateState {
 # ---------- controles
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "$AppName $AppVersion"
-$form.Size = New-Object System.Drawing.Size(720, 620)
+$form.Size = New-Object System.Drawing.Size(720, 655)
 $form.MinimumSize = $form.Size
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
@@ -671,33 +869,49 @@ $txtDest.Location = '110,116'; $txtDest.Size = '470,25'; $txtDest.Anchor = 'Top,
 $btnBrowse = New-Object System.Windows.Forms.Button
 $btnBrowse.Text = 'Cambiar...'; $btnBrowse.Location = '590,114'; $btnBrowse.Size = '100,28'; $btnBrowse.Anchor = 'Top,Right'
 
+$chkMirror = New-Object System.Windows.Forms.CheckBox
+$chkMirror.Text = 'Enviar copia a:'; $chkMirror.Location = '15,152'; $chkMirror.AutoSize = $true
+
+$txtMirror = New-Object System.Windows.Forms.TextBox
+$txtMirror.Location = '140,150'; $txtMirror.Size = '440,25'; $txtMirror.Anchor = 'Top,Left,Right'
+
+$btnMirror = New-Object System.Windows.Forms.Button
+$btnMirror.Text = 'Cambiar...'; $btnMirror.Location = '590,148'; $btnMirror.Size = '100,28'; $btnMirror.Anchor = 'Top,Right'
+
+$tip = New-Object System.Windows.Forms.ToolTip
+$tip.SetToolTip($chkMirror, 'Al terminar, manda lo descargado también a esta carpeta (por ejemplo \\pc-casa\Videos por Tailscale). Si no se puede, queda pendiente y se reintenta.')
+$tip.SetToolTip($txtMirror, 'Ejemplo: \\pc-casa\Videos\GoPro')
+
 $chkSidecar = New-Object System.Windows.Forms.CheckBox
 $chkSidecar.Text = 'Incluir archivos LRV/THM (proxies de baja resolución y miniaturas)'
-$chkSidecar.Location = '110,148'; $chkSidecar.AutoSize = $true; $chkSidecar.Checked = $Settings.IncludeSidecar
+$chkSidecar.Location = '110,184'; $chkSidecar.AutoSize = $true; $chkSidecar.Checked = $Settings.IncludeSidecar
 
 $btnDownload = New-Object System.Windows.Forms.Button
-$btnDownload.Text = 'Descargar todo'; $btnDownload.Location = '15,180'; $btnDownload.Size = '180,42'
+$btnDownload.Text = 'Descargar todo'; $btnDownload.Location = '15,214'; $btnDownload.Size = '180,42'
 $btnDownload.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
 $btnDownload.BackColor = 'SteelBlue'; $btnDownload.ForeColor = 'White'; $btnDownload.FlatStyle = 'Flat'
 
 $btnCancel = New-Object System.Windows.Forms.Button
-$btnCancel.Text = 'Cancelar'; $btnCancel.Location = '205,180'; $btnCancel.Size = '100,42'; $btnCancel.Enabled = $false
+$btnCancel.Text = 'Cancelar'; $btnCancel.Location = '205,214'; $btnCancel.Size = '100,42'; $btnCancel.Enabled = $false
+
+$btnPending = New-Object System.Windows.Forms.Button
+$btnPending.Location = '315,214'; $btnPending.Size = '180,42'; $btnPending.Visible = $false
 
 $btnOpen = New-Object System.Windows.Forms.Button
-$btnOpen.Text = 'Abrir carpeta'; $btnOpen.Location = '570,180'; $btnOpen.Size = '120,42'; $btnOpen.Anchor = 'Top,Right'
+$btnOpen.Text = 'Abrir carpeta'; $btnOpen.Location = '570,214'; $btnOpen.Size = '120,42'; $btnOpen.Anchor = 'Top,Right'
 
 $progress = New-Object System.Windows.Forms.ProgressBar
-$progress.Location = '15,235'; $progress.Size = '675,22'; $progress.Maximum = 1000; $progress.Anchor = 'Top,Left,Right'
+$progress.Location = '15,269'; $progress.Size = '675,22'; $progress.Maximum = 1000; $progress.Anchor = 'Top,Left,Right'
 
 $lblFile = New-Object System.Windows.Forms.Label
-$lblFile.Location = '15,263'; $lblFile.Size = '675,20'; $lblFile.Anchor = 'Top,Left,Right'
+$lblFile.Location = '15,297'; $lblFile.Size = '675,20'; $lblFile.Anchor = 'Top,Left,Right'
 
 $lblSpeed = New-Object System.Windows.Forms.Label
-$lblSpeed.Location = '15,283'; $lblSpeed.Size = '675,20'; $lblSpeed.Anchor = 'Top,Left,Right'; $lblSpeed.ForeColor = 'DimGray'
+$lblSpeed.Location = '15,317'; $lblSpeed.Size = '675,20'; $lblSpeed.Anchor = 'Top,Left,Right'; $lblSpeed.ForeColor = 'DimGray'
 
 $txtLog = New-Object System.Windows.Forms.TextBox
 $txtLog.Multiline = $true; $txtLog.ScrollBars = 'Vertical'; $txtLog.ReadOnly = $true
-$txtLog.Location = '15,310'; $txtLog.Size = '675,260'; $txtLog.Anchor = 'Top,Bottom,Left,Right'
+$txtLog.Location = '15,344'; $txtLog.Size = '675,260'; $txtLog.Anchor = 'Top,Bottom,Left,Right'
 $txtLog.Font = New-Object System.Drawing.Font('Consolas', 9); $txtLog.BackColor = 'White'
 
 $timer = New-Object System.Windows.Forms.Timer
@@ -709,15 +923,28 @@ $updTimer.Interval = 500
 $updTimer.Add_Tick({ try { Update-UpdateState } catch { $updTimer.Stop(); Write-Log "Error actualizando: $_" } })
 
 $form.Controls.AddRange(@($lblType, $rbGoPro, $rbInsta, $rbFolder, $btnDetect, $lblDevice, $lblSrc, $txtSrc, $btnSrc,
-    $lblDest, $txtDest, $btnBrowse, $chkSidecar, $btnDownload, $btnCancel, $btnOpen, $progress, $lblFile, $lblSpeed, $txtLog))
+    $lblDest, $txtDest, $btnBrowse, $chkMirror, $txtMirror, $btnMirror, $chkSidecar, $btnDownload, $btnCancel, $btnPending, $btnOpen,
+    $progress, $lblFile, $lblSpeed, $txtLog))
 
 # ---------- eventos
 $rbGoPro.Add_CheckedChanged({ if ($rbGoPro.Checked -and -not $script:Loading) { Set-Device 'GoPro' } })
 $rbInsta.Add_CheckedChanged({ if ($rbInsta.Checked -and -not $script:Loading) { Set-Device 'Insta360' } })
 $rbFolder.Add_CheckedChanged({ if ($rbFolder.Checked -and -not $script:Loading) { Set-Device 'Folder' } })
-$txtDest.Add_TextChanged({ if (-not $script:Loading) { $Settings.Dest[$script:Device] = $txtDest.Text.Trim() } })
-$txtSrc.Add_TextChanged({ if (-not $script:Loading -and $script:Device -eq 'Folder') { $Settings.SourceFolder = $txtSrc.Text.Trim(); Update-Status } })
+$txtDest.Add_TextChanged({ if (-not $script:Loading) { $Settings.Dest[$script:Device] = Get-CleanPath $txtDest.Text } })
+$txtSrc.Add_TextChanged({ if (-not $script:Loading -and $script:Device -eq 'Folder') { $Settings.SourceFolder = Get-CleanPath $txtSrc.Text; Update-Status } })
 $chkSidecar.Add_CheckedChanged({ $Settings.IncludeSidecar = $chkSidecar.Checked })
+$txtMirror.Add_TextChanged({ if (-not $script:Loading) { $Settings.Mirror[$script:Device] = Get-CleanPath $txtMirror.Text } })
+$chkMirror.Add_CheckedChanged({
+    $txtMirror.Enabled = $chkMirror.Checked; $btnMirror.Enabled = $chkMirror.Checked
+    if (-not $script:Loading) { $Settings.MirrorOn[$script:Device] = $chkMirror.Checked }
+})
+$btnMirror.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Elegí a dónde enviar la copia (podés escribir una ruta de red como \\pc-casa\Videos en el cuadro de texto)'
+    $dlg.SelectedPath = Get-CleanPath $txtMirror.Text
+    if ($dlg.ShowDialog() -eq 'OK') { $txtMirror.Text = $dlg.SelectedPath }
+})
+$btnPending.Add_Click({ Start-Worker 'Pending' '' '' '' })
 
 $btnDetect.Add_Click({ Invoke-Detect })
 $btnDownload.Add_Click({ Start-Download })
@@ -736,8 +963,8 @@ $btnBrowse.Add_Click({
 })
 $btnOpen.Add_Click({
     try {
-        New-Item -ItemType Directory -Force -Path $txtDest.Text | Out-Null
-        Start-Process explorer.exe $txtDest.Text
+        New-Folder (Get-CleanPath $txtDest.Text)
+        Start-Process explorer.exe (Get-CleanPath $txtDest.Text)
     } catch { Write-Log "No se puede abrir la carpeta: $_" }
 })
 $form.Add_FormClosing({
@@ -750,6 +977,7 @@ $form.Add_FormClosing({
 })
 $form.Add_Shown({
     Select-Device $Settings.Device
+    Update-PendingButton
     Invoke-Detect
     Start-UpdateCheck
 })

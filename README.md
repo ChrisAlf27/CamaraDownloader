@@ -18,6 +18,18 @@ App de Windows para descargar rápido todos los archivos de una **GoPro**, una *
 2. Abrí la app. Si detecta una cámara, la elige sola; si no, elegí **GoPro**, **Insta360** u **Otra carpeta**. Con *Otra carpeta* elegís el origen a mano.
 3. Revisá **Guardar en** (cada opción recuerda su propia carpeta) y tocá **Descargar todo**.
 
+### Otra carpeta
+
+Con **Otra carpeta** se copia la carpeta elegida **completa**, con su nombre y sus subcarpetas, dentro de *Guardar en* (por ejemplo `Guardar en\Mis PDFs\...`). Sirve para cualquier tipo de archivo (PDF, documentos, fotos...): no se ordena por fecha y se conserva la fecha de cada archivo. Si la repetís, copia solo lo nuevo.
+
+### Enviar copia a otra PC
+
+Tildá **Enviar copia a** y poné una carpeta compartida de otra PC, por ejemplo `\\pc-casa\Videos` (con Tailscale o en la misma red). Al terminar la descarga, lo nuevo se manda también ahí, con la misma estructura de carpetas.
+
+- Si la otra PC está apagada o se corta la conexión, lo que falta queda **pendiente**: aparece el botón **Enviar pendientes (N)** y además se reintenta en la próxima descarga.
+- Lo descargado queda siempre en *Guardar en*, así que la cámara se puede liberar aunque el envío falle.
+- Cada opción (GoPro, Insta360, Otra carpeta) recuerda su propia carpeta de envío.
+
 ## Qué hace
 
 - Detecta la cámara por USB (MTP) o como unidad / tarjeta SD. El lector de tarjetas es 2 a 3 veces más rápido.
@@ -51,4 +63,4 @@ Requisitos para compilar: `winget install JRSoftware.InnoSetup GitHub.cli` y `gh
 
 - Por MTP, Windows puede devolver los nombres sin extensión y fechas vacías (1899-12-30). La app toma el nombre real con `System.FileName` y busca la fecha en varias propiedades y en las columnas de fecha del Explorador.
 - Las copias se hacen a un archivo temporal (`.part`, o la carpeta oculta `_copiando` para MTP) y se renombran al terminar: en el destino nunca queda un archivo a medias.
-- La configuración se guarda en `%APPDATA%\CamaraDownloader\settings.json`.
+- La configuración se guarda en `%APPDATA%\CamaraDownloader\settings.json`; los envíos pendientes, en `pendientes.json` en la misma carpeta.
