@@ -20,15 +20,19 @@ App de Windows para descargar rápido todos los archivos de una **GoPro**, una *
 
 ### Otra carpeta
 
-Con **Otra carpeta** se copia la carpeta elegida **completa**, con su nombre y sus subcarpetas, dentro de *Guardar en* (por ejemplo `Guardar en\Mis PDFs\...`). Sirve para cualquier tipo de archivo (PDF, documentos, fotos...): no se ordena por fecha y se conserva la fecha de cada archivo. Si la repetís, copia solo lo nuevo.
+Con **Otra carpeta** se copia la carpeta elegida **completa**, con su nombre y sus subcarpetas, dentro del destino (por ejemplo `Guardar en\Mis PDFs\...`). Sirve para cualquier tipo de archivo (PDF, documentos, fotos...): no se ordena por fecha y se conserva la fecha de cada archivo. Si la repetís, copia solo lo nuevo.
 
-### Enviar copia a otra PC
+### Destino: esta PC, otra PC o las dos
 
-Tildá **Enviar copia a** y poné una carpeta compartida de otra PC, por ejemplo `\\pc-casa\Videos` (con Tailscale o en la misma red). Al terminar la descarga, lo nuevo se manda también ahí, con la misma estructura de carpetas.
+En **Enviar a** se pone una carpeta compartida de otra PC, por ejemplo `\\pc-casa\Videos` (con Tailscale o en la misma red). En **Destino** elegís qué hacer:
 
-- Si la otra PC está apagada o se corta la conexión, lo que falta queda **pendiente**: aparece el botón **Enviar pendientes (N)** y además se reintenta en la próxima descarga.
-- Lo descargado queda siempre en *Guardar en*, así que la cámara se puede liberar aunque el envío falle.
-- Cada opción (GoPro, Insta360, Otra carpeta) recuerda su propia carpeta de envío.
+| Destino | Qué hace | Ideal para |
+|---|---|---|
+| **Solo esta PC** | Guarda en *Guardar en*. | Uso normal |
+| **Esta PC y enviar** | Guarda en *Guardar en* y al terminar manda lo nuevo a *Enviar a*. Si la otra PC está apagada o se corta, queda **pendiente**: aparece **Enviar pendientes (N)** y también se reintenta en la próxima descarga. | Cámaras: se liberan rápido y queda una copia segura aunque falle el envío |
+| **Solo enviar** | Copia directo a *Enviar a*, sin dejar copia en esta PC. Si se corta, tocá **Descargar todo** otra vez y sigue desde donde quedó. | Carpetas (PDFs, documentos) |
+
+Cada opción (GoPro, Insta360, Otra carpeta) recuerda su propio destino y sus carpetas.
 
 ## Qué hace
 

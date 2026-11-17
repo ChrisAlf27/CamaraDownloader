@@ -4,7 +4,7 @@
 # La copia corre en un hilo aparte para que la ventana nunca se congele.
 
 $AppName    = 'Cámara Downloader'
-$AppVersion = '2.1.0'
+$AppVersion = '2.2.0'
 $UpdateRepo = 'ChrisAlf27/CamaraDownloader'
 $SetupAsset = 'CamaraDownloader-Setup.exe'
 
@@ -30,7 +30,8 @@ $Settings = @{
     }
     # "Enviar copia a": segunda carpeta (ej. \\pc-casa\Videos por Tailscale) a la que se mandan los archivos nuevos
     Mirror   = @{ GoPro = ''; Insta360 = ''; Folder = '' }
-    MirrorOn = @{ GoPro = $false; Insta360 = $false; Folder = $false }
+    # Destino de cada opcion: Local = solo esta PC; Both = esta PC y enviar; Send = solo enviar (directo, sin copia local)
+    Mode     = @{ GoPro = ''; Insta360 = ''; Folder = '' }
 }
 try {
     if (Test-Path -LiteralPath $SettingsFile) {
@@ -41,10 +42,17 @@ try {
         foreach ($k in $DeviceTypes) {
             if ($j.Dest.$k) { $Settings.Dest[$k] = [string]$j.Dest.$k }
             if ($j.Mirror.$k) { $Settings.Mirror[$k] = [string]$j.Mirror.$k }
-            if ($null -ne $j.MirrorOn.$k) { $Settings.MirrorOn[$k] = [bool]$j.MirrorOn.$k }
+            if (@('Local', 'Both', 'Send') -contains $j.Mode.$k) { $Settings.Mode[$k] = [string]$j.Mode.$k }
+            elseif ($j.MirrorOn.$k) { $Settings.Mode[$k] = 'Both' }   # configuracion de la 2.1 ("Enviar copia a" tildado)
         }
     }
 } catch {}
+foreach ($k in $DeviceTypes) {
+    if (-not $Settings.Mode[$k]) {
+        # Camara: guardar aca y enviar (libera la camara rapido). Carpeta: solo enviar, si ya hay a donde.
+        $Settings.Mode[$k] = if ($k -eq 'Folder' -and $Settings.Mirror[$k]) { 'Send' } else { 'Local' }
+    }
+}
 # Archivos que no se pudieron enviar (PC destino apagada, sin conexion...): se reintentan despues
 $PendingFile = Join-Path $SettingsDir 'pendientes.json'
 
@@ -577,13 +585,27 @@ function Write-Log([string]$msg) {
 function Set-Status([string]$text, [string]$color) { $lblDevice.Text = $text; $lblDevice.ForeColor = $color }
 
 function Set-Busy([bool]$b) {
-    foreach ($c in @($btnDownload, $btnDetect, $btnBrowse, $txtDest, $rbGoPro, $rbInsta, $rbFolder, $chkMirror, $btnPending)) { $c.Enabled = -not $b }
+    foreach ($c in @($btnDownload, $btnDetect, $rbGoPro, $rbInsta, $rbFolder, $pnlMode, $btnPending)) { $c.Enabled = -not $b }
     $btnSrc.Enabled = (-not $b) -and $script:Device -eq 'Folder'
     $chkSidecar.Enabled = (-not $b) -and $script:Device -ne 'Folder'   # en "Otra carpeta" se copia todo
-    $txtMirror.Enabled = (-not $b) -and $chkMirror.Checked
-    $btnMirror.Enabled = (-not $b) -and $chkMirror.Checked
+    Update-ModeFields $b
     $txtSrc.Enabled = -not $b
     $btnCancel.Enabled = $b
+}
+
+function Get-Mode {
+    if ($rbSend.Checked) { return 'Send' }
+    if ($rbBoth.Checked) { return 'Both' }
+    return 'Local'
+}
+
+# Habilita "Guardar en" y "Enviar a" segun el destino elegido
+function Update-ModeFields([bool]$busy = $false) {
+    $m = Get-Mode
+    $txtDest.Enabled = (-not $busy) -and $m -ne 'Send'
+    $btnBrowse.Enabled = $txtDest.Enabled
+    $txtMirror.Enabled = (-not $busy) -and $m -ne 'Local'
+    $btnMirror.Enabled = $txtMirror.Enabled
 }
 
 function Update-PendingButton {
@@ -597,7 +619,7 @@ function Update-Status {
     if ($t -eq 'Folder') {
         $p = Get-CleanPath $txtSrc.Text
         if (-not $p) { Set-Status 'Elegí la carpeta de origen con "Elegir..."' 'DimGray' }
-        elseif (Test-Path -LiteralPath $p -PathType Container) { Set-Status "Carpeta lista: se copia completa en Guardar en\$(Split-Path $p -Leaf)" 'ForestGreen' }
+        elseif (Test-Path -LiteralPath $p -PathType Container) { Set-Status "Carpeta lista: se copia completa, como `"$(Split-Path $p -Leaf)`"" 'ForestGreen' }
         else { Set-Status 'La carpeta de origen no existe' 'Firebrick' }
         return
     }
@@ -624,8 +646,8 @@ function Set-Device([string]$type) {
     $chkSidecar.Enabled = $type -ne 'Folder'
     if ($type -eq 'Folder') { $txtSrc.Text = $Settings.SourceFolder }
     $txtMirror.Text = $Settings.Mirror[$type]
-    $chkMirror.Checked = [bool]$Settings.MirrorOn[$type]
-    $txtMirror.Enabled = $chkMirror.Checked; $btnMirror.Enabled = $chkMirror.Checked
+    switch ($Settings.Mode[$type]) { 'Send' { $rbSend.Checked = $true } 'Both' { $rbBoth.Checked = $true } default { $rbLocal.Checked = $true } }
+    Update-ModeFields
     $script:Loading = $false
     Update-Status
 }
@@ -668,13 +690,13 @@ function Start-Download {
         Invoke-Detect $false
         if (-not ($script:Cameras | Where-Object { $_.Type -eq $type })) { return }
     }
+    $mode = Get-Mode
     $destRoot = Get-CleanPath $txtDest.Text
+    $mirrorRoot = Get-CleanPath $txtMirror.Text
+    if ($mode -ne 'Local' -and -not $mirrorRoot) { Show-Msg 'Elegí a dónde enviar los archivos ("Enviar a"), por ejemplo \\pc-casa\Videos.'; return }
+    if ($mode -eq 'Send') { $destRoot = $mirrorRoot }   # solo enviar: se copia directo ahi, sin copia en esta PC
+    if ($mode -ne 'Both') { $mirrorRoot = '' }
     if (-not $destRoot) { Show-Msg 'Elegí dónde guardar los archivos.'; return }
-    $mirrorRoot = ''
-    if ($chkMirror.Checked) {
-        $mirrorRoot = Get-CleanPath $txtMirror.Text
-        if (-not $mirrorRoot) { Show-Msg 'Elegí a dónde enviar la copia, o destildá "Enviar copia a".'; return }
-    }
     try {
         foreach ($p in @($srcFolder, $destRoot, $mirrorRoot)) { if ($p) { [void][IO.Path]::GetFullPath($p) } }
     } catch { Show-Msg "La ruta `"$p`" no es válida.`n`n$($_.Exception.InnerException.Message)"; return }
@@ -683,10 +705,10 @@ function Start-Download {
     }
     if ($mirrorRoot -and ((Test-PathInside $mirrorRoot $destRoot) -or (Test-PathInside $destRoot $mirrorRoot) -or
                           ($srcFolder -and ((Test-PathInside $mirrorRoot $srcFolder) -or (Test-PathInside $srcFolder $mirrorRoot))))) {
-        Show-Msg 'La carpeta de "Enviar copia a" tiene que ser distinta del origen y de "Guardar en" (y no estar una dentro de la otra).'; return
+        Show-Msg 'La carpeta de "Enviar a" tiene que ser distinta del origen y de "Guardar en" (y no estar una dentro de la otra).'; return
     }
     try { New-Folder $destRoot }
-    catch { [System.Windows.Forms.MessageBox]::Show("No se puede crear $destRoot`n$_", 'Error') | Out-Null; return }
+    catch { [System.Windows.Forms.MessageBox]::Show("No se puede usar $destRoot`n`n$_", 'Error') | Out-Null; return }
     Save-Settings
     Start-Worker $type $srcFolder $destRoot $mirrorRoot
 }
@@ -826,7 +848,7 @@ function Update-UpdateState {
 # ---------- controles
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "$AppName $AppVersion"
-$form.Size = New-Object System.Drawing.Size(720, 655)
+$form.Size = New-Object System.Drawing.Size(720, 690)
 $form.MinimumSize = $form.Size
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
@@ -860,58 +882,74 @@ $txtSrc.Location = '110,82'; $txtSrc.Size = '470,25'; $txtSrc.Anchor = 'Top,Left
 $btnSrc = New-Object System.Windows.Forms.Button
 $btnSrc.Text = 'Elegir...'; $btnSrc.Location = '590,80'; $btnSrc.Size = '100,28'; $btnSrc.Anchor = 'Top,Right'
 
+$lblMode = New-Object System.Windows.Forms.Label
+$lblMode.Text = 'Destino:'; $lblMode.Location = '15,119'; $lblMode.AutoSize = $true
+
+# Panel propio para que estos botones no se mezclen con los de GoPro / Insta360 / Otra carpeta
+$pnlMode = New-Object System.Windows.Forms.Panel
+$pnlMode.Location = '108,113'; $pnlMode.Size = '580,28'; $pnlMode.Anchor = 'Top,Left,Right'
+$rbLocal = New-Object System.Windows.Forms.RadioButton
+$rbLocal.Text = 'Solo esta PC'; $rbLocal.Location = '2,4'; $rbLocal.AutoSize = $true
+$rbBoth = New-Object System.Windows.Forms.RadioButton
+$rbBoth.Text = 'Esta PC y enviar'; $rbBoth.Location = '125,4'; $rbBoth.AutoSize = $true
+$rbSend = New-Object System.Windows.Forms.RadioButton
+$rbSend.Text = 'Solo enviar'; $rbSend.Location = '275,4'; $rbSend.AutoSize = $true
+$pnlMode.Controls.AddRange(@($rbLocal, $rbBoth, $rbSend))
+
 $lblDest = New-Object System.Windows.Forms.Label
-$lblDest.Text = 'Guardar en:'; $lblDest.Location = '15,119'; $lblDest.AutoSize = $true
+$lblDest.Text = 'Guardar en:'; $lblDest.Location = '15,153'; $lblDest.AutoSize = $true
 
 $txtDest = New-Object System.Windows.Forms.TextBox
-$txtDest.Location = '110,116'; $txtDest.Size = '470,25'; $txtDest.Anchor = 'Top,Left,Right'
+$txtDest.Location = '110,150'; $txtDest.Size = '470,25'; $txtDest.Anchor = 'Top,Left,Right'
 
 $btnBrowse = New-Object System.Windows.Forms.Button
-$btnBrowse.Text = 'Cambiar...'; $btnBrowse.Location = '590,114'; $btnBrowse.Size = '100,28'; $btnBrowse.Anchor = 'Top,Right'
+$btnBrowse.Text = 'Cambiar...'; $btnBrowse.Location = '590,148'; $btnBrowse.Size = '100,28'; $btnBrowse.Anchor = 'Top,Right'
 
-$chkMirror = New-Object System.Windows.Forms.CheckBox
-$chkMirror.Text = 'Enviar copia a:'; $chkMirror.Location = '15,152'; $chkMirror.AutoSize = $true
+$lblMirror = New-Object System.Windows.Forms.Label
+$lblMirror.Text = 'Enviar a:'; $lblMirror.Location = '15,187'; $lblMirror.AutoSize = $true
 
 $txtMirror = New-Object System.Windows.Forms.TextBox
-$txtMirror.Location = '140,150'; $txtMirror.Size = '440,25'; $txtMirror.Anchor = 'Top,Left,Right'
+$txtMirror.Location = '110,184'; $txtMirror.Size = '470,25'; $txtMirror.Anchor = 'Top,Left,Right'
 
 $btnMirror = New-Object System.Windows.Forms.Button
-$btnMirror.Text = 'Cambiar...'; $btnMirror.Location = '590,148'; $btnMirror.Size = '100,28'; $btnMirror.Anchor = 'Top,Right'
+$btnMirror.Text = 'Cambiar...'; $btnMirror.Location = '590,182'; $btnMirror.Size = '100,28'; $btnMirror.Anchor = 'Top,Right'
 
 $tip = New-Object System.Windows.Forms.ToolTip
-$tip.SetToolTip($chkMirror, 'Al terminar, manda lo descargado también a esta carpeta (por ejemplo \\pc-casa\Videos por Tailscale). Si no se puede, queda pendiente y se reintenta.')
+$tip.SetToolTip($rbLocal, 'Guarda los archivos solo en "Guardar en".')
+$tip.SetToolTip($rbBoth, 'Guarda en esta PC y al terminar los manda a "Enviar a". Si no se pueden mandar, quedan pendientes y se reintenta. Recomendado para cámaras: se liberan rápido.')
+$tip.SetToolTip($rbSend, 'Copia directo a "Enviar a", sin dejar copia en esta PC. Si se corta, tocá "Descargar todo" otra vez y sigue desde donde quedó.')
 $tip.SetToolTip($txtMirror, 'Ejemplo: \\pc-casa\Videos\GoPro')
 
 $chkSidecar = New-Object System.Windows.Forms.CheckBox
 $chkSidecar.Text = 'Incluir archivos LRV/THM (proxies de baja resolución y miniaturas)'
-$chkSidecar.Location = '110,184'; $chkSidecar.AutoSize = $true; $chkSidecar.Checked = $Settings.IncludeSidecar
+$chkSidecar.Location = '110,218'; $chkSidecar.AutoSize = $true; $chkSidecar.Checked = $Settings.IncludeSidecar
 
 $btnDownload = New-Object System.Windows.Forms.Button
-$btnDownload.Text = 'Descargar todo'; $btnDownload.Location = '15,214'; $btnDownload.Size = '180,42'
+$btnDownload.Text = 'Descargar todo'; $btnDownload.Location = '15,248'; $btnDownload.Size = '180,42'
 $btnDownload.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
 $btnDownload.BackColor = 'SteelBlue'; $btnDownload.ForeColor = 'White'; $btnDownload.FlatStyle = 'Flat'
 
 $btnCancel = New-Object System.Windows.Forms.Button
-$btnCancel.Text = 'Cancelar'; $btnCancel.Location = '205,214'; $btnCancel.Size = '100,42'; $btnCancel.Enabled = $false
+$btnCancel.Text = 'Cancelar'; $btnCancel.Location = '205,248'; $btnCancel.Size = '100,42'; $btnCancel.Enabled = $false
 
 $btnPending = New-Object System.Windows.Forms.Button
-$btnPending.Location = '315,214'; $btnPending.Size = '180,42'; $btnPending.Visible = $false
+$btnPending.Location = '315,248'; $btnPending.Size = '180,42'; $btnPending.Visible = $false
 
 $btnOpen = New-Object System.Windows.Forms.Button
-$btnOpen.Text = 'Abrir carpeta'; $btnOpen.Location = '570,214'; $btnOpen.Size = '120,42'; $btnOpen.Anchor = 'Top,Right'
+$btnOpen.Text = 'Abrir carpeta'; $btnOpen.Location = '570,248'; $btnOpen.Size = '120,42'; $btnOpen.Anchor = 'Top,Right'
 
 $progress = New-Object System.Windows.Forms.ProgressBar
-$progress.Location = '15,269'; $progress.Size = '675,22'; $progress.Maximum = 1000; $progress.Anchor = 'Top,Left,Right'
+$progress.Location = '15,303'; $progress.Size = '675,22'; $progress.Maximum = 1000; $progress.Anchor = 'Top,Left,Right'
 
 $lblFile = New-Object System.Windows.Forms.Label
-$lblFile.Location = '15,297'; $lblFile.Size = '675,20'; $lblFile.Anchor = 'Top,Left,Right'
+$lblFile.Location = '15,331'; $lblFile.Size = '675,20'; $lblFile.Anchor = 'Top,Left,Right'
 
 $lblSpeed = New-Object System.Windows.Forms.Label
-$lblSpeed.Location = '15,317'; $lblSpeed.Size = '675,20'; $lblSpeed.Anchor = 'Top,Left,Right'; $lblSpeed.ForeColor = 'DimGray'
+$lblSpeed.Location = '15,351'; $lblSpeed.Size = '675,20'; $lblSpeed.Anchor = 'Top,Left,Right'; $lblSpeed.ForeColor = 'DimGray'
 
 $txtLog = New-Object System.Windows.Forms.TextBox
 $txtLog.Multiline = $true; $txtLog.ScrollBars = 'Vertical'; $txtLog.ReadOnly = $true
-$txtLog.Location = '15,344'; $txtLog.Size = '675,260'; $txtLog.Anchor = 'Top,Bottom,Left,Right'
+$txtLog.Location = '15,378'; $txtLog.Size = '675,260'; $txtLog.Anchor = 'Top,Bottom,Left,Right'
 $txtLog.Font = New-Object System.Drawing.Font('Consolas', 9); $txtLog.BackColor = 'White'
 
 $timer = New-Object System.Windows.Forms.Timer
@@ -923,7 +961,7 @@ $updTimer.Interval = 500
 $updTimer.Add_Tick({ try { Update-UpdateState } catch { $updTimer.Stop(); Write-Log "Error actualizando: $_" } })
 
 $form.Controls.AddRange(@($lblType, $rbGoPro, $rbInsta, $rbFolder, $btnDetect, $lblDevice, $lblSrc, $txtSrc, $btnSrc,
-    $lblDest, $txtDest, $btnBrowse, $chkMirror, $txtMirror, $btnMirror, $chkSidecar, $btnDownload, $btnCancel, $btnPending, $btnOpen,
+    $lblMode, $pnlMode, $lblDest, $txtDest, $btnBrowse, $lblMirror, $txtMirror, $btnMirror, $chkSidecar, $btnDownload, $btnCancel, $btnPending, $btnOpen,
     $progress, $lblFile, $lblSpeed, $txtLog))
 
 # ---------- eventos
@@ -934,13 +972,16 @@ $txtDest.Add_TextChanged({ if (-not $script:Loading) { $Settings.Dest[$script:De
 $txtSrc.Add_TextChanged({ if (-not $script:Loading -and $script:Device -eq 'Folder') { $Settings.SourceFolder = Get-CleanPath $txtSrc.Text; Update-Status } })
 $chkSidecar.Add_CheckedChanged({ $Settings.IncludeSidecar = $chkSidecar.Checked })
 $txtMirror.Add_TextChanged({ if (-not $script:Loading) { $Settings.Mirror[$script:Device] = Get-CleanPath $txtMirror.Text } })
-$chkMirror.Add_CheckedChanged({
-    $txtMirror.Enabled = $chkMirror.Checked; $btnMirror.Enabled = $chkMirror.Checked
-    if (-not $script:Loading) { $Settings.MirrorOn[$script:Device] = $chkMirror.Checked }
-})
+foreach ($rb in @($rbLocal, $rbBoth, $rbSend)) {
+    $rb.Add_CheckedChanged({
+        if (-not $this.Checked) { return }
+        Update-ModeFields
+        if (-not $script:Loading) { $Settings.Mode[$script:Device] = Get-Mode }
+    })
+}
 $btnMirror.Add_Click({
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = 'Elegí a dónde enviar la copia (podés escribir una ruta de red como \\pc-casa\Videos en el cuadro de texto)'
+    $dlg.Description = 'Elegí a dónde enviar los archivos (podés escribir una ruta de red como \\pc-casa\Videos en el cuadro de texto)'
     $dlg.SelectedPath = Get-CleanPath $txtMirror.Text
     if ($dlg.ShowDialog() -eq 'OK') { $txtMirror.Text = $dlg.SelectedPath }
 })
@@ -963,8 +1004,9 @@ $btnBrowse.Add_Click({
 })
 $btnOpen.Add_Click({
     try {
-        New-Folder (Get-CleanPath $txtDest.Text)
-        Start-Process explorer.exe (Get-CleanPath $txtDest.Text)
+        $p = if ((Get-Mode) -eq 'Send') { Get-CleanPath $txtMirror.Text } else { Get-CleanPath $txtDest.Text }
+        New-Folder $p
+        Start-Process explorer.exe $p
     } catch { Write-Log "No se puede abrir la carpeta: $_" }
 })
 $form.Add_FormClosing({
