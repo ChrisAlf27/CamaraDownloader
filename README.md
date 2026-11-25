@@ -22,6 +22,8 @@ App de Windows para descargar rápido todos los archivos de una **GoPro**, una *
 
 Con **Otra carpeta** se copia la carpeta elegida **completa**, con su nombre y sus subcarpetas, dentro del destino (por ejemplo `Guardar en\Mis PDFs\...`). Sirve para cualquier tipo de archivo (PDF, documentos, fotos...): no se ordena por fecha y se conserva la fecha de cada archivo. Si la repetís, copia solo lo nuevo.
 
+También sirve para una carpeta de un **celular conectado por USB** (en modo *Transferencia de archivos*): con **Elegir...** entrás a *Este equipo → (tu celular) → ...* y elegís la carpeta, por ejemplo un álbum de la Galería. El origen queda escrito como en el Explorador (`Este equipo\POCO X7 Pro\Almacenamiento interno compartido\Pictures\Gallery\owner\Mi álbum`) y también se puede pegar a mano.
+
 ### Destino: esta PC, otra PC o las dos
 
 En **Enviar a** se pone una carpeta compartida de otra PC, por ejemplo `\\pc-casa\Videos` (con Tailscale o en la misma red). En **Destino** elegís qué hacer:

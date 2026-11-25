@@ -4,7 +4,7 @@
 # La copia corre en un hilo aparte para que la ventana nunca se congele.
 
 $AppName    = 'Cámara Downloader'
-$AppVersion = '2.2.0'
+$AppVersion = '2.3.0'
 $UpdateRepo = 'ChrisAlf27/CamaraDownloader'
 $SetupAsset = 'CamaraDownloader-Setup.exe'
 
@@ -225,10 +225,48 @@ function Find-Cameras {
     return $found.ToArray()
 }
 
+# Carpeta de un dispositivo sin letra de unidad (celular por USB, MTP). Se escribe como la muestra el
+# Explorador: "Este equipo\POCO X7 Pro\Almacenamiento interno compartido\DCIM\Camera".
+function Test-ShellPath([string]$p) { return [bool]$p -and $p -notmatch '^[a-zA-Z]:|^\\\\' }
+
+# Devuelve el FolderItem de esa carpeta (o $null si el dispositivo no esta conectado / no existe)
+function Resolve-ShellFolder([string]$path) {
+    $root = $script:Shell.NameSpace(17)
+    $parts = @($path -split '\\' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($parts.Count -and ($parts[0] -eq $root.Title -or $parts[0] -match '^(Este equipo|Equipo|Mi PC|This PC|Computer)$')) {
+        $parts = @($parts | Select-Object -Skip 1)
+    }
+    if (-not $parts.Count) { return $null }
+    $cur = $root; $item = $null
+    foreach ($name in $parts) {
+        $item = $cur.Items() | Where-Object { $_.IsFolder -and $_.Name -eq $name } | Select-Object -First 1
+        if (-not $item) { return $null }
+        $cur = $item.GetFolder
+    }
+    return $item
+}
+
+# Ruta legible ("Este equipo\...") de una carpeta elegida en el selector del Shell
+function Get-ShellFolderPath($folder) {
+    if ($folder.Self.IsFileSystem) { return $folder.Self.Path }
+    $pcPath = $script:Shell.NameSpace(17).Self.Path
+    $names = New-Object System.Collections.ArrayList
+    $f = $folder
+    while ($f -and $f.Self.Path -ne $pcPath) { [void]$names.Insert(0, $f.Title); $f = $f.ParentFolder }
+    if (-not $f) { return $null }   # fuera de "Este equipo" (ej. Red): no se puede volver a encontrar por nombre
+    return (@($script:Shell.NameSpace(17).Title) + $names) -join '\'
+}
+
 # Origen a descargar segun el tipo elegido (camara detectada o carpeta)
 function Find-Source([string]$type, [string]$folder) {
     if ($type -eq 'Folder') {
-        if (-not $folder -or -not (Test-Path -LiteralPath $folder -PathType Container)) { return $null }
+        if (-not $folder) { return $null }
+        if (Test-ShellPath $folder) {
+            $it = Resolve-ShellFolder $folder
+            if (-not $it) { return $null }
+            return @{ Type = 'Folder'; Mode = 'MTP'; Name = $folder; Folders = @($it); Recurse = $true }
+        }
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) { return $null }
         $fi = Get-Item -LiteralPath $folder
         return @{ Type = 'Folder'; Mode = 'Drive'; Name = $fi.FullName; Folders = @($fi); Recurse = $true }
     }
@@ -254,18 +292,28 @@ function Get-SourceFiles($src) {
                     Folder = $folderKey; Ref = $fi; Sidecar = ($SidecarExt -contains $fi.Extension.ToUpper()) })
             }
         } else {
-            $sf = $f.GetFolder
-            foreach ($it in $sf.Items()) {
-                if ($it.IsFolder) { continue }
-                $name = Get-ItemFileName $it
-                if ($SkipNames -contains $name) { continue }
-                $date = Get-NameDate $name; if (-not $date) { $date = Get-MtpDate $it $sf }
-                [void]$list.Add([pscustomobject]@{ Name = $name; Size = (Get-MtpSize $it); Date = $date
-                    Folder = $f.Name; Ref = $it; Sidecar = ($SidecarExt -contains [IO.Path]::GetExtension($name).ToUpper()) })
-            }
+            Add-ShellFiles $list $src $f.GetFolder $(if ($src.Recurse) { '.' } else { $f.Name })
         }
     }
     return $list
+}
+
+# Archivos de una carpeta por MTP (camara o celular). En "Otra carpeta" se recorren las subcarpetas.
+# ShellFolder = carpeta que contiene el archivo (para borrarlo despues)
+function Add-ShellFiles($list, $src, $sf, [string]$folderKey) {
+    foreach ($it in $sf.Items()) {
+        if ($it.IsFolder) {
+            if ($src.Recurse) { Add-ShellFiles $list $src $it.GetFolder $(if ($folderKey -eq '.') { $it.Name } else { "$folderKey\$($it.Name)" }) }
+            continue
+        }
+        $name = Get-ItemFileName $it
+        if ($SkipNames -contains $name) { continue }
+        $date = $null
+        if ($src.Type -ne 'Folder') { $date = Get-NameDate $name }
+        if (-not $date) { $date = Get-MtpDate $it $sf }
+        [void]$list.Add([pscustomobject]@{ Name = $name; Size = (Get-MtpSize $it); Date = $date; Folder = $folderKey
+            Ref = $it; ShellFolder = $sf; Sidecar = ($SidecarExt -contains [IO.Path]::GetExtension($name).ToUpper()) })
+    }
 }
 '@
 
@@ -405,7 +453,8 @@ try {
     $destBase = $destRoot
     if ($folderMode) {
         $fi0 = $src.Folders[0]
-        $baseName = if ($fi0.Parent) { $fi0.Name } else { 'Unidad ' + (($fi0.FullName -replace '[\\/:*?"<>|]+', ' ').Trim()) }
+        $baseName = if ($src.Mode -eq 'MTP') { ($fi0.Name -replace '[\\/:*?"<>|]+', ' ').Trim() }
+                    elseif ($fi0.Parent) { $fi0.Name } else { 'Unidad ' + (($fi0.FullName -replace '[\\/:*?"<>|]+', ' ').Trim()) }
         $destBase = Join-Path $destRoot $baseName
         Log "Se copia la carpeta completa en $destBase"
     }
@@ -619,6 +668,7 @@ function Update-Status {
     if ($t -eq 'Folder') {
         $p = Get-CleanPath $txtSrc.Text
         if (-not $p) { Set-Status 'Elegí la carpeta de origen con "Elegir..."' 'DimGray' }
+        elseif (Test-ShellPath $p) { Set-Status "Carpeta del celular / dispositivo USB: se copia completa, como `"$(Split-Path $p -Leaf)`"" 'ForestGreen' }
         elseif (Test-Path -LiteralPath $p -PathType Container) { Set-Status "Carpeta lista: se copia completa, como `"$(Split-Path $p -Leaf)`"" 'ForestGreen' }
         else { Set-Status 'La carpeta de origen no existe' 'Firebrick' }
         return
@@ -683,7 +733,15 @@ function Start-Download {
     $srcFolder = ''
     if ($type -eq 'Folder') {
         $srcFolder = Get-CleanPath $txtSrc.Text
-        if (-not $srcFolder -or -not (Test-Path -LiteralPath $srcFolder -PathType Container)) {
+        $isShell = Test-ShellPath $srcFolder
+        if ($isShell) {
+            Set-Status 'Buscando la carpeta en el dispositivo...' 'DimGray'; [System.Windows.Forms.Application]::DoEvents()
+            $found = $null; try { $found = Resolve-ShellFolder $srcFolder } catch {}
+            Update-Status
+            if (-not $found) {
+                Show-Msg "No se encuentra la carpeta en el dispositivo. Revisá que el celular esté conectado por USB, desbloqueado y en modo `"Transferencia de archivos`".`n`nOrigen: $srcFolder"; return
+            }
+        } elseif (-not $srcFolder -or -not (Test-Path -LiteralPath $srcFolder -PathType Container)) {
             Show-Msg "Elegí una carpeta de origen que exista.`n`nOrigen: $srcFolder"; return
         }
     } elseif (-not ($script:Cameras | Where-Object { $_.Type -eq $type })) {
@@ -691,6 +749,7 @@ function Start-Download {
         if (-not ($script:Cameras | Where-Object { $_.Type -eq $type })) { return }
     }
     $mode = Get-Mode
+    $srcDisk = if ($type -eq 'Folder' -and -not $isShell) { $srcFolder } else { '' }   # para comparar rutas de disco
     $destRoot = Get-CleanPath $txtDest.Text
     $mirrorRoot = Get-CleanPath $txtMirror.Text
     if ($mode -ne 'Local' -and -not $mirrorRoot) { Show-Msg 'Elegí a dónde enviar los archivos ("Enviar a"), por ejemplo \\pc-casa\Videos.'; return }
@@ -698,13 +757,13 @@ function Start-Download {
     if ($mode -ne 'Both') { $mirrorRoot = '' }
     if (-not $destRoot) { Show-Msg 'Elegí dónde guardar los archivos.'; return }
     try {
-        foreach ($p in @($srcFolder, $destRoot, $mirrorRoot)) { if ($p) { [void][IO.Path]::GetFullPath($p) } }
+        foreach ($p in @($srcDisk, $destRoot, $mirrorRoot)) { if ($p) { [void][IO.Path]::GetFullPath($p) } }
     } catch { Show-Msg "La ruta `"$p`" no es válida.`n`n$($_.Exception.InnerException.Message)"; return }
-    if ($type -eq 'Folder' -and ((Test-PathInside $destRoot $srcFolder) -or (Test-PathInside $srcFolder $destRoot))) {
+    if ($srcDisk -and ((Test-PathInside $destRoot $srcDisk) -or (Test-PathInside $srcDisk $destRoot))) {
         Show-Msg 'La carpeta de origen y la de destino no pueden estar una dentro de la otra.'; return
     }
     if ($mirrorRoot -and ((Test-PathInside $mirrorRoot $destRoot) -or (Test-PathInside $destRoot $mirrorRoot) -or
-                          ($srcFolder -and ((Test-PathInside $mirrorRoot $srcFolder) -or (Test-PathInside $srcFolder $mirrorRoot))))) {
+                          ($srcDisk -and ((Test-PathInside $mirrorRoot $srcDisk) -or (Test-PathInside $srcDisk $mirrorRoot))))) {
         Show-Msg 'La carpeta de "Enviar a" tiene que ser distinta del origen y de "Guardar en" (y no estar una dentro de la otra).'; return
     }
     try { New-Folder $destRoot }
@@ -785,8 +844,7 @@ function Ask-Delete {
         } else {
             # Un borrado por carpeta: Windows pide una sola confirmacion
             foreach ($grp in ($toDelete | Group-Object Folder)) {
-                $fold = $src.Folders | Where-Object { $_.Name -eq $grp.Name } | Select-Object -First 1
-                $items = $fold.GetFolder.Items()
+                $items = $grp.Group[0].ShellFolder.Items()
                 $items.Filter(0x40, (($grp.Group | ForEach-Object { $_.Ref.Name } | Sort-Object -Unique) -join ';'))
                 if ($items.Count -gt 0) { $items.InvokeVerbEx('delete') }
                 [System.Windows.Forms.Application]::DoEvents()
@@ -991,10 +1049,12 @@ $btnDetect.Add_Click({ Invoke-Detect })
 $btnDownload.Add_Click({ Start-Download })
 $btnCancel.Add_Click({ if ($script:Sync) { $script:Sync.Cancel = $true }; Write-Log 'Cancelando (termina el archivo actual)...' })
 $btnSrc.Add_Click({
-    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = 'Elegí la carpeta con los archivos a descargar'
-    if ($txtSrc.Text -and (Test-Path -LiteralPath $txtSrc.Text)) { $dlg.SelectedPath = $txtSrc.Text }
-    if ($dlg.ShowDialog() -eq 'OK') { $txtSrc.Text = $dlg.SelectedPath }
+    # Selector del Shell (no FolderBrowserDialog): permite elegir carpetas de un celular conectado por USB,
+    # que no tienen letra de unidad. 0x40 = estilo nuevo (redimensionable), 0x200 = sin boton "Nueva carpeta"
+    $f = $script:Shell.BrowseForFolder([int]$form.Handle, 'Elegí la carpeta con los archivos a descargar (puede ser del celular, en Este equipo)', 0x240, 17)
+    if (-not $f) { return }
+    $p = Get-ShellFolderPath $f
+    if ($p) { $txtSrc.Text = $p } else { Show-Msg 'Esa carpeta no se puede usar como origen. Elegí una dentro de "Este equipo".' }
 })
 $btnBrowse.Add_Click({
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
